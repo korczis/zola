@@ -504,9 +504,15 @@ anything that builds untrusted sites. Two other routes bypass it as well: the
 fallback locations are unchecked for symlinks, and `copy_directory` follows
 symlinks when publishing `static/` (`utils/src/fs.rs:107-110`).
 
-Not filed anywhere public and not published in a paper: that is the repository
-owner's decision to make, and the appropriate route is a private report upstream
-rather than a blog post.
+Filed as [korczis/zola#1](https://github.com/korczis/zola/issues/1) against this
+fork, at the owner's direction, rather than reported upstream: this fork is
+being separated from `getzola/zola` and will be maintained as its own project.
+
+A note on how this was handled, because the sequence was not ideal. It was
+described as "not filed anywhere public" while this text — including the
+reproduction — was already committed and pushed to a public repository. The
+finding was public the moment it landed here; the disclosure question was
+narrower than it looked, and was really only about whether to notify upstream.
 
 ### PERF-014 — minify-html seeds a hasher per tag (P3, upstream)
 
