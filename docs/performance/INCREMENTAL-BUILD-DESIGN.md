@@ -122,7 +122,19 @@ must be re-parsed".
 6. if `path`/`slug`/`aliases` changed, the URL changed: delete the old outputs,
    re-check path collisions.
 
-Steps 3–6 are the ones `--fast` skips today.
+Steps 3–6 were the ones `--fast` skipped. **Step 3 is now partly done**: the
+sections that list the page are re-rendered, along with their pagers and feeds,
+and step 4's re-sort happens because `populate_sections()` runs before anything
+is rendered. What remains unimplemented is the rest of step 3 — taxonomy terms,
+their feeds, and backlink pages — and steps 5 and 6.
+
+Taxonomy terms are the next piece and they are blocked on a small refactor rather
+than on design: `site::queue` has `single_page` and `single_section` but no
+single-term entry point, and writing one means duplicating how a term's output
+path, pagers and feed are derived from `full_build`. Two places that must agree
+on an output path is how output bugs are made, so the job-building should be
+extracted and shared instead. `components/site/tests/fast_rebuild.rs` asserts
+that terms are currently stale, and will fail when this is done.
 
 ### A page is added or deleted
 

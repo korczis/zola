@@ -47,6 +47,15 @@ output verified for each change. Details and the rejected experiments are in
   reporting `Done in 23ms` and serving the previous build. The startup guard
   against clobbering a directory was being re-asked on every rebuild, by which
   point the server itself had filled it.
+- `zola serve --fast` now refreshes the sections that list an edited page, not
+  only the page itself. A page's title appears in its section's index, so
+  re-rendering the page and leaving the index showing the old title read as the
+  rebuild having half worked. Membership is looked up rather than derived from
+  the page's directory, so a `transparent` section's parent is refreshed too. A
+  content edit on a 4000-page site stays well under a tenth of the full rebuild
+  it replaces. **Taxonomy term pages, the taxonomy list and the sitemap are still
+  not refreshed** and need a full rebuild; there is a test asserting that, so the
+  boundary is a decision rather than a surprise.
 - `zola serve --fast` applied nothing. A content change was detected and
   re-parsed, the render job ran, and the server kept returning the page as it
   was before the edit — reporting `Done in 0ms` while doing so. Rendering reads

@@ -653,14 +653,46 @@ impl Site {
     pub fn add_and_render_page(&mut self, path: &Path) -> Result<()> {
         let page = Page::from_file(path, &self.config, &self.base_path)?;
         self.add_page(page, true)?;
+        // `title`, `date`, `weight` and `slug` all feed a section's ordering, so
+        // the graph is rebuilt before anything is rendered from it. This also
+        // refreshes `lower`/`higher` on the page's siblings.
+        self.populate_sections();
         // The renderer reads page values out of the `RenderCache`, not out of
         // the `Library`, so adding the page is not enough: without this the
         // edit is parsed, the job runs, and the template is handed the copy
         // that was serialized before the edit. `zola serve --fast` reported
         // "Done in 0ms" and kept serving the old HTML.
         self.rebuild_cache();
+
         let page = self.library.pages.get(path).unwrap();
-        Queue::single_page(self, page).process()
+        Queue::single_page(self, page).process()?;
+
+        // Then whatever lists it. A section shows its pages' titles, so leaving
+        // the listing alone means an edit appears on the page and not in the
+        // index that links to it — which reads as the rebuild having half
+        // worked. Membership is looked up rather than derived from the parent
+        // directory: a `transparent` section hands its pages up the chain, so
+        // one page can be listed by several sections.
+        let listing_sections: Vec<PathBuf> = self
+            .library
+            .sections
+            .iter()
+            .filter(|(_, section)| {
+                section.pages.iter().any(|p| p == path)
+                    || section.hidden_pages.iter().any(|p| p == path)
+            })
+            .map(|(section_path, _)| section_path.clone())
+            .collect();
+
+        for section_path in listing_sections {
+            let section = &self.library.sections[&section_path];
+            // `false`: the pages themselves are not re-rendered, only the
+            // section, its pagers and its feed. Re-rendering every page of a
+            // section on each keystroke is what `--fast` exists to avoid.
+            Queue::single_section(self, section, false).process()?;
+        }
+
+        Ok(())
     }
 
     /// Add a section to the site
