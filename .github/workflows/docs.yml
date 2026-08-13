@@ -30,7 +30,15 @@ jobs:
           working_directory: docs
 
   deploy:
-    if: github.ref == 'refs/heads/master'
+    # Upstream only. A fork has no Pages site to deploy to, so this step fails
+    # with a 404 from actions/deploy-pages on every push to master and the run
+    # goes red for a reason that has nothing to do with the change. The build job
+    # above still runs everywhere, so a fork keeps the check that matters: that
+    # the documentation site builds.
+    #
+    # To publish this fork's docs (or its papers) instead, enable Pages on the
+    # fork and change this condition to name it.
+    if: github.ref == 'refs/heads/master' && github.repository == 'getzola/zola'
     runs-on: ubuntu-latest
     needs: build
     environment:
