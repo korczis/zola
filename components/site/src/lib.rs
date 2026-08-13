@@ -22,7 +22,7 @@ use crate::queue::Queue;
 use config::{Config, IndexFormat, get_config};
 use content::{Library, Page, Section, Taxonomy};
 use errors::{Result, anyhow, bail};
-use relative_path::RelativePathBuf;
+use relative_path::{RelativePath, RelativePathBuf};
 use render::{RenderCache, Renderer};
 use templates::load_tera;
 use utils::fs::{
@@ -32,8 +32,53 @@ use utils::net::get_available_port;
 use utils::timings;
 use utils::types::InsertAnchor;
 
-pub static SITE_CONTENT: LazyLock<Arc<RwLock<HashMap<RelativePathBuf, String>>>> =
+/// Rendered HTML/XML held for `zola serve`, compressed.
+///
+/// `serve` keeps every rendered page here instead of writing it to disk, which
+/// costs as much memory as the site's entire output — 9.4 GB on a site with
+/// 9 GB of HTML, against 493 MB to build it (PERF-016). Pages of a
+/// template-driven site are mostly the same bytes as each other, and each page
+/// is mostly the same bytes as itself: the reference site's navigation is 88%
+/// of every page. zstd at level 1 gets 29× on that shape, so the map costs
+/// hundreds of megabytes rather than gigabytes.
+///
+/// Private, because whether the bytes are compressed is nobody else's business:
+/// go through `site_content_*`.
+type CompressedOutputs = HashMap<RelativePathBuf, Vec<u8>>;
+
+static SITE_CONTENT: LazyLock<Arc<RwLock<CompressedOutputs>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
+
+/// Level 1: on this data levels 3 and 6 buy 11% and 16% more compression for
+/// proportionally more time, on a path that runs once per output on every
+/// rebuild. The ratio is dominated by the repetition inside a page, which even
+/// level 1 finds.
+const SITE_CONTENT_LEVEL: i32 = 1;
+
+/// Store a rendered output for `serve` to hand back.
+pub fn site_content_insert(path: RelativePathBuf, content: &str) {
+    let compressed = zstd::encode_all(content.as_bytes(), SITE_CONTENT_LEVEL)
+        .expect("compressing rendered output cannot fail: the input is in memory");
+    SITE_CONTENT.write().unwrap().insert(path, compressed);
+}
+
+/// The rendered output at `path`, if `serve` has one.
+pub fn site_content_get(path: &RelativePath) -> Option<String> {
+    let compressed = SITE_CONTENT.read().unwrap().get(path).cloned()?;
+    let bytes = zstd::decode_all(compressed.as_slice()).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+pub fn site_content_clear() {
+    SITE_CONTENT.write().unwrap().clear();
+}
+
+/// How many outputs are held, and how many bytes they occupy compressed.
+/// Only used by tests and diagnostics.
+pub fn site_content_stats() -> (usize, usize) {
+    let map = SITE_CONTENT.read().unwrap();
+    (map.len(), map.values().map(|v| v.len()).sum())
+}
 
 /// Where are we building the site
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -134,7 +179,7 @@ impl Site {
 
     /// Enable some `zola serve` related options
     pub fn enable_serve_mode(&mut self, build_mode: BuildMode) {
-        SITE_CONTENT.write().unwrap().clear();
+        site_content_clear();
         self.config.enable_serve_mode();
         self.build_mode = build_mode;
     }
@@ -245,37 +290,47 @@ impl Site {
                 continue;
             }
 
+            // `file_type` comes from the directory read that produced this entry
+            // (WalkDir already resolved it, since we follow links), so it costs
+            // nothing; `path.is_dir()` would be another `stat` per file.
+            let is_dir = entry.file_type().is_dir();
+
             // skip hidden files and non md files
-            if !path.is_dir() && (!file_name.ends_with(".md") || file_name.starts_with('.')) {
+            if !is_dir && (!file_name.ends_with(".md") || file_name.starts_with('.')) {
                 continue;
             }
 
             // is it a section or not?
-            if path.is_dir() {
+            if is_dir {
                 // if we are processing a section we have to collect
                 // index files for all languages and process them simultaneously
                 // before any of the pages
-                let index_files = WalkDir::new(path)
-                    .follow_links(true)
-                    .max_depth(1)
-                    .into_iter()
-                    .filter_map(|e| match e {
-                        Err(_) => None,
-                        Ok(f) => {
-                            let path_str = f.path().file_name().unwrap().to_str().unwrap();
-                            // https://github.com/getzola/zola/issues/1244
-                            if f.path().is_file() && allowed_index_filenames.contains(path_str) {
-                                Some(f)
-                            } else {
-                                None
-                            }
-                        }
-                    })
-                    .collect::<Vec<DirEntry>>();
+                // A plain `read_dir` rather than a second `WalkDir`: the outer
+                // walk already visits every one of these entries, and WalkDir
+                // adds its own bookkeeping on top of the directory read. Only
+                // the handful of `_index.*` candidates are stat'ed, and
+                // `path.is_file()` is kept for them so a symlinked index file
+                // still resolves (https://github.com/getzola/zola/issues/1244).
+                let mut index_files: Vec<PathBuf> = match std::fs::read_dir(path) {
+                    Ok(entries) => entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| allowed_index_filenames.contains(n))
+                                && p.is_file()
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                // `read_dir` order is filesystem-defined; the previous WalkDir
+                // walk was sorted, and section insertion order is observable
+                // through error ordering, so keep it deterministic.
+                index_files.sort();
 
                 for index_file in index_files {
-                    let section =
-                        Section::from_file(index_file.path(), &self.config, &self.base_path)?;
+                    let section = Section::from_file(&index_file, &self.config, &self.base_path)?;
                     sections.insert(section.components.join("/"));
 
                     // if the section is drafted we can skip the entire dir
@@ -598,6 +653,12 @@ impl Site {
     pub fn add_and_render_page(&mut self, path: &Path) -> Result<()> {
         let page = Page::from_file(path, &self.config, &self.base_path)?;
         self.add_page(page, true)?;
+        // The renderer reads page values out of the `RenderCache`, not out of
+        // the `Library`, so adding the page is not enough: without this the
+        // edit is parsed, the job runs, and the template is handed the copy
+        // that was serialized before the edit. `zola serve --fast` reported
+        // "Done in 0ms" and kept serving the old HTML.
+        self.rebuild_cache();
         let page = self.library.pages.get(path).unwrap();
         Queue::single_page(self, page).process()
     }
@@ -630,6 +691,9 @@ impl Site {
         let old_meta = self.library.sections.get(path).map(|s| s.meta.clone());
         self.add_section(section, true)?;
         self.populate_sections();
+        // Same reason as in `add_and_render_page`: the renderer reads the
+        // section (and its page list) out of the `RenderCache`.
+        self.rebuild_cache();
         let section = self.library.sections.get(path).unwrap();
         let render_pages = old_meta.map(|m| section.needs_pages_render(&m)).unwrap_or(true);
         Queue::single_section(self, section, render_pages).process()

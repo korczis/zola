@@ -71,27 +71,35 @@ change, ranked by how close they are to the edge.
    instead of a nested `WalkDir`.
 7. **PERF-002** — per-thread highlighting registries, or an upstream giallo fix
    so `RegSet` is not shared.
-8. **PERF-007** — parallelise the static copy.
+8. **PERF-007** — parallelise the static copy. *(tried; rejected — slower.)*
 9. **PERF-010** — register Tera functions once, and share `Config`/`permalinks`
    behind `Arc` instead of cloning per function.
 10. **PERF-009** — avoid the `stat` per `load_data` cache-key computation once
     PERF-001 lands (it becomes the remaining serial syscall on that path).
+    *(Re-profiled after PERF-001: rejected. Every `stat` in the build together
+    is 439 ms of self time, so this one is a few milliseconds, and the mtime it
+    reads is what keeps the cache from serving stale data.)*
 
 ## Summary table
 
 | ID | Location | Operation | Called | Complexity | Evidence | Baseline cost | Priority |
 | -- | -------- | --------- | ------ | ---------- | -------- | ------------- | -------- |
 | PERF-001 | `templates/src/functions/load_data.rs:317` | global mutex held across file read + parse | once per `load_data()` | O(calls) forced serial | profile: 61.0% of busy CPU (reference proxy), 72.4% (data-heavy-4k), attributed to `LoadData::call → Mutex::lock` | 6306/10334 busy samples | **P0** |
-| PERF-002 | `giallo-0.5.2 pattern_set.rs:21` via `markdown::render_content` | `Mutex<RegSet>` around every Oniguruma match | once per code-block token | O(matches) forced serial | profile: 80.6% of busy CPU blocked (markdown-heavy-4k), 39–57% elsewhere | 49 456/61 447 busy samples | **P0** |
-| PERF-003 | `site/src/queue.rs` `write_output` | `create_dir_all` per rendered output | once per output file | O(outputs × depth) syscalls | profile: 18.9% busy CPU (simple-1k), 13.3% (mixed-4k); 1237 ms in `mkdir` | 1.24 s CPU at 4k pages | **P1** |
-| PERF-004 | `utils/src/fs.rs:216` `clean_site_output_folder` | single-threaded recursive delete of previous output | once per build | O(output files) serial | timings: 663 ms = 36.3% of wall (reference proxy, 6544 files / 73 MB) | 663 ms wall | **P1** |
+| PERF-002 | `giallo-0.5.2 pattern_set.rs:21` via `markdown::render_content` | `Mutex<RegSet>` around every Oniguruma match | once per code-block token | O(matches) forced serial | profile: 80.6% of busy CPU blocked (markdown-heavy-4k) | **−64% wall on markdown-heavy; shipped via `vendor/giallo`** | **done** |
+| PERF-003 | `site/src/queue.rs` `write_output` | `create_dir_all` per rendered output | once per output file | O(outputs × depth) syscalls | profile: 18.9% busy CPU (simple-1k) — **but two fixes measured no gain, see OPTIMIZATIONS.md** | none recoverable | **rejected** |
+| PERF-004 | `utils/src/fs.rs:216` `clean_site_output_folder` | single-threaded recursive delete of previous output | once per build | O(output files) serial | timings: 663 ms = 36.3% of wall — **but parallel deletion and rename-aside both measured no wall gain, see OPTIMIZATIONS.md** | none recoverable | **rejected** |
 | PERF-005 | `render/src/cache.rs:59` `RenderCache::build` | sequential; deep serde re-serialization of every page value into its section and every taxonomy term | once per build | O(P × value size × memberships), single-threaded | timings: 346 ms = 24.3% of wall (mixed-4k); RSS 406 KB/page (many-taxonomies) vs 77 KB/page (simple) | 346 ms wall, ~2.6 GB RSS at 8k | **P1** |
 | PERF-006 | `site/src/lib.rs:190` discover loop | serial `WalkDir` + a second `WalkDir(max_depth=1)` per directory + serial `Section::from_file` | once per build | O(dirs) serial, 2 traversals | timings: 232–357 ms = 13–27% of wall (reference proxy, 1640 sections) | 232 ms wall | **P1** |
-| PERF-007 | `utils/src/fs.rs:107` `copy_directory` | serial copy of the static tree, 2 `stat`s per file | once per build | O(static files) serial | timings: 138–170 ms = 9–10% of wall (989 files / 55 MB) | 170 ms wall | **P2** |
-| PERF-008 | `render/src/cache.rs:84`,`151` sibling injection | `Value::into_map()` on a shared `Arc<Map>` forces a map copy per page with siblings | once per page | O(P × map size) | profile: `Value as Serialize` 2.9–4.2% busy CPU; part of PERF-005's memory | included in PERF-005 | P2 |
-| PERF-009 | `templates/src/functions/load_data.rs:157` | `get_file_time()` `stat` on every cache-key computation | once per `load_data()` | O(calls) syscalls | 4843 calls on the reference workload; `stat` visible in self time | small but on the P0 path | P2 |
+| PERF-007 | `utils/src/fs.rs:107` `copy_directory` | serial copy of the static tree, 2 `stat`s per file | once per build | O(static files) serial | timings: 138–170 ms = 9–10% of wall (989 files / 55 MB) — **but the parallel copy measured 10–30% *slower*, see OPTIMIZATIONS.md** | none recoverable | **rejected** |
+| PERF-008 | `render/src/cache.rs:84`,`151` sibling injection | `Value::into_map()` on a shared `Arc<Map>` forces a map copy per page with siblings | once per page | O(P × map size) | profile: `Value as Serialize` 2.9–4.2% busy CPU — **but PERF-005a took the whole cache phase to 2.5% (31 ms on the reference site), so this is a fraction of a fraction** | absorbed by PERF-005a | **done** |
+| PERF-009 | `templates/src/functions/load_data.rs:157` | `get_file_time()` `stat` on every cache-key computation | once per `load_data()` | O(calls) syscalls | 4843 calls on the reference workload — **but every `stat` in the whole build is 439 ms of self time, so this is a few ms** | none worth taking | **rejected** |
 | PERF-010 | `site/src/tpls.rs:5` `register_early_global_fns` | clones `Config`, `permalinks`, `colocated_assets` and the whole `Tera` per registration; runs twice | 2× per build | O(P) copies | timings: 44 ms = 3.1% of wall (mixed-4k) | 44 ms wall | P2 |
-| PERF-011 | `config` highlighting registry init | ~170 MB RSS and ~110 ms before any page is processed | once | O(1) | baseline: 100-page build = 128 ms / 174 MB | fixed overhead | P3 |
+| PERF-011 | `config` highlighting registry init | ~170 MB RSS and ~110 ms before any page is processed | once | O(1) | baseline: 100-page build = 128 ms / 174 MB; **now 52 ms / 76 MB, of which the registry is 32 ms** | fixed overhead, mostly already gone | P3, blocked |
+| PERF-012 | the platform allocator | large `String` churn (render → minify → drop) on every worker | once per output | O(outputs × page size) | profile: 34 s of 138 s busy CPU in `_xzm_*`/`_free` (reference site) | **−23.7% CPU on the reference site; shipped as mimalloc** | **done** |
+| PERF-013 | `templates/src/functions/files.rs:133,199` | `get_url(cachebust=true)` and `get_hash(path=…)` re-read and re-hash the file on every call | once per call per page | O(P × file size) | profile: `compute_hash` 2.2 s self CPU; the reference site hashes 3 files (one of them the search index) on all 5601 outputs | **2.2 s CPU, gone from the profile; below the noise floor of a whole-build A/B** | **done** |
+| PERF-014 | `minify_html::parse::element::parse_tag` (dependency) | seeds a new ahash hasher per tag parsed | once per HTML tag | O(tags) | profile: `gen_hasher_seed` 1.9 s self CPU (2.2%), 1825 of its 1898 samples under `parse_tag` | 1.9 s CPU on the reference site | P3, upstream |
+| PERF-016 | `site/src/lib.rs` `SITE_CONTENT` + `BuildMode::Memory` | `zola serve` retains every rendered page in memory for the life of the process | once per output | O(total output size) | `footprint`: 9248 MB resident serving the reference site, against **493 MB** to build it | **compressed in memory: 9.4 GB → 0.88 GB, and `--store-html` serves from disk at 0.29 GB** | **partial** |
+| PERF-015 | `templates/src/helpers.rs` `search_for_file` | up to 5 `exists()` probes, and 2 `canonicalize` calls — but **only** when the file sits directly under the site root | once per call per page | O(P × calls) syscalls | profile: `canonicalize` 360 ms, `stat` 439 ms self CPU — 0.9% of the build between them — **but the provably safe subset is worth ~0.5%, below this machine's noise floor** | none worth taking | **rejected** |
 
 ## Detail
 
@@ -159,11 +167,39 @@ gap *is* the serialization.
 does not affect it — but it affects the majority of Zola sites, and it is the
 single largest CPU item across the synthetic suite.
 
-**Proposed change (needs design).** Options, in increasing order of intrusiveness:
-1. per-thread `Registry` clones so each worker owns its `RegSet` (memory cost:
-   one grammar set per thread — must be measured against the 170 MB baseline);
-2. group code blocks by language and highlight them in one batch per worker;
-3. upstream fix in giallo (thread-local regsets, or a pool).
+**Investigated 2026-08-12 — the fix belongs upstream.** Reading giallo:
+
+* `PatternSet { rule_refs, regset: Option<Mutex<RegSet>> }`
+  (`grammars/pattern_set.rs:21`) is the only lock on the hot path.
+* Pattern sets are shared: `Registry::get_or_create_pattern_set` hands out
+  `Arc<PatternSet>` from a registry-wide cache, so every worker highlighting the
+  same language contends on one mutex.
+* `Scope::new` also takes a global lock (`scope.rs:216`) but only during grammar
+  compilation, not per token — it is not part of this problem.
+
+A Zola-side workaround would mean a per-thread `Registry`, rebuilt from
+`Registry::dump()` bytes with `Registry::load()`. That was rejected without
+implementing it:
+
+* memory: the registry retains ~23 MB (measured in `ALLOCATIONS.md`, the
+  `config` phase), so 12 workers would add ~270 MB — comparable to the entire
+  peak heap after PERF-005a;
+* correctness: `Registry::load` calls `replace_global_scope_repo`, documented
+  as "only the first call succeeds". Scope values are indices into that
+  repository, so several registries sharing one repo is safe only as long as
+  every thread loads a byte-identical dump. That is true today and would be an
+  invisible trap tomorrow.
+
+**Ceiling of a proper fix.** The phase costs 3.37 s single-threaded and 3.96 s
+on 12 threads (`markdown-heavy-2000`). If matching parallelised like the rest of
+the markdown work, the phase should approach 3.37/12 ≈ 0.3 s — roughly 3.6 s per
+2000 code-heavy pages.
+
+**Upstream ask.** giallo needs the `RegSet` to be per-thread (a thread-local or
+a small pool of regsets per pattern set) rather than one mutex per pattern set.
+`onig_regset_search` writes to internal region storage, which is why the mutex
+exists, so the fix is to give each searcher its own storage rather than to
+remove the lock.
 
 **Correctness risk.** Medium — highlighting output must be byte-identical, which
 the output-equivalence gate checks directly.
@@ -228,12 +264,266 @@ parallel; replace the nested `WalkDir` with a single `read_dir` per directory.
 The draft-section `skip_current_dir` behaviour and the error ordering must be
 preserved.
 
-### PERF-007 — static copy is serial (P2)
+### PERF-007 — static copy is serial (rejected)
 
 `copy_directory` walks and copies file by file, doing `metadata()` on source and
 destination for each. 989 files / 55 MB costs 138–170 ms of wall time on the
-reference workload. Parallelising with rayon is straightforward; `hard_link_static`
-already exists as a user-side mitigation.
+reference workload.
+
+Parallelising it with rayon made it **10–30% slower** on the case it should have
+helped most (5000 files of 1 KB), and did nothing on the reference site, where
+the phase is disk-throughput bound at ~290 MB/s. Measurements in
+`OPTIMIZATIONS.md`. `hard_link_static` remains the user-side mitigation.
+
+### PERF-012 — the allocator itself (done)
+
+Not a line of Zola code: a quarter of the reference site's busy CPU was inside
+macOS's own `malloc`, because rendering a page allocates a multi-megabyte string,
+minifying it allocates another, and twelve threads do this at once. Replacing the
+global allocator with mimalloc took 23.7% off the build's CPU with byte-identical
+output. Details and the caveat (it does nothing for small-page sites) in
+`OPTIMIZATIONS.md`.
+
+### PERF-013 — file hashes are recomputed per page (P2)
+
+`get_url(cachebust=true)` and `get_hash(path=…)` each open, read and SHA the
+target file on every call. A cachebusted `<link>` in `base.html` therefore hashes
+the same stylesheet once per output. On the reference site that is three files
+(including the multi-megabyte generated search index) hashed 5601 times, 2.2 s of
+`compute_hash` self CPU plus the reads feeding it.
+
+The fix is a build-scoped memo keyed by path and validated by `(mtime, len)` —
+the same discipline `load_data` already uses. Validation is not optional here:
+`search_for_file` also looks in the *output* directory, so a hashed file can be
+one the build itself writes, and a path-only cache could capture it before it is
+written.
+
+### PERF-008 — sibling injection copies each page's map (closed)
+
+Still true as written: the `siblings` pass holds a clone of each neighbour's
+value while it rebuilds a page's map, so the `Arc<Map>` is shared and
+`into_map()` copies the top level. The copy is shallow — every entry in it is an
+`Arc` — and PERF-005a took the whole `build render cache` phase from 24.3% of a
+build to 2.5% (31 ms on the reference site's 3776 pages).
+
+There is nothing here worth a change. Closed as absorbed by PERF-005a rather
+than left open at P2.
+
+### PERF-011 — the fixed cost of loading the highlighting registry (P3, blocked)
+
+`Highlighting::init` calls `Registry::builtin()` while the config is parsed, so
+every build pays for every builtin grammar whether or not it renders a single
+code block.
+
+Most of what this item described is already gone: PERF-005a and PERF-010 took a
+100-page build from 128 ms / 174 MB to **52 ms / 76 MB**. What remains is 32 ms
+of `config` phase — 62% of a 100-page build, and 0.1% of a large one.
+
+Deferring it is blocked on something other than performance. `init` also
+validates that the configured theme names exist, and that check needs the
+registry. Made lazy, the error `Theme ... does not exist` would move from
+config-parse time to the first code block — and on a site with no code blocks it
+would never appear at all. Losing a config error is not a trade this program
+makes for 32 ms. It needs a way to enumerate theme names without building the
+registry, which is a giallo change.
+
+### PERF-016 — `zola serve` holds the entire rendered site in memory (P1)
+
+Found by accident, and it is the largest memory number this program has
+produced. `zola serve` runs in `BuildMode::Memory`: rendered HTML goes into the
+`SITE_CONTENT` global map instead of to disk, and stays there.
+
+For the reference site:
+
+| | peak memory |
+| --- | ----------- |
+| `zola build` | 493 MB |
+| `zola serve` | **9242 MB** (peak 9386 MB) |
+
+That is 19× the build, and it is simply the output — 6592 files, 9.03 GB of
+HTML — held in a map. On a 24 GB machine this site already occupies 39% of RAM
+just to be served; a site twice its size could not be served at all, while
+building it would still cost well under a gigabyte.
+
+Worth noting how easy this is to mismeasure: `ps -o rss` reports 8–20 MB for the
+same process, because macOS compresses the pages of an idle process out of
+resident memory and they fault back in as they are touched. Use `footprint -p`
+or `phys_footprint`; RSS answers a different question.
+
+The whole program measured `zola build` and never looked at `serve`, so this sits
+outside everything in `BASELINE.md`. Three directions, none of them measured yet:
+
+* **render on demand** — `serve` already holds the `Library` and the
+  `RenderCache`; a request could render its page then, which is the same work
+  `--fast` does in 34–41 ms for a whole rebuild. Retaining rendered HTML buys
+  request latency that a static-site preview server does not obviously need.
+* **a disk-backed serve mode** — `BuildMode` has `Disk`, `Memory` and `Both`,
+  and `serve` can only pick the latter two (`--store-html` selects `Both`, which
+  writes *and* retains). There is no way to serve a large site without paying
+  full-output RAM.
+* **evict or compress** — smallest change, and the least satisfying.
+
+The first is the interesting one and it interacts with the incremental-build
+design; it is not a change to make casually inside a performance program whose
+gate is byte-identical `zola build` output.
+
+**What was done (2026-08-13): the second one, because it was already half-built.**
+`--store-html` selected `BuildMode::Both`, which wrote every page to disk *and*
+kept it in memory. The request handler already falls back to the output
+directory when the in-memory map misses — it is how assets have always been
+served — so the second copy bought nothing but memory. `--store-html` now
+selects `BuildMode::Disk`.
+
+Measured on the reference site, both servers running at the same moment:
+
+| | resident | peak |
+| --- | -------- | ---- |
+| `zola serve` | 9248 MB | 9431 MB |
+| `zola serve --store-html` | **289 MB** | **503 MB** |
+
+**32× less resident memory, 19× less peak**, and responses are byte-identical:
+ten paths compared between the two servers — pages, the sitemap, the search
+index, a CSS and a JS asset, and a 404 — all matched once the port each server
+embeds in `base_url` is normalized.
+
+The costs, which are real and are why the default did not change:
+
+* a full rebuild now pays for writing the files — 1.3–1.5 s against 0.45 s on a
+  4000-page site;
+* requests read from the filesystem rather than a map;
+* responses gain `Access-Control-Allow-Origin: *`, which the disk path has
+  always sent and the memory path never did.
+
+**And then the default, which is the part that matters.** Serving from disk needs
+a flag and changes what serve does; compressing the map needs neither. Pages of
+a template-driven site are mostly the same bytes *as themselves* — the reference
+site's navigation is 88% of every page — so zstd at level 1 gets **29×** on this
+data, measured per output because that is how the map stores them.
+
+`SITE_CONTENT` now holds zstd-compressed bytes behind `site_content_get/insert/
+clear`, so whether they are compressed is not the caller's business. Three
+interleaved rounds, same site:
+
+| | resident |
+| --- | -------- |
+| before | 9371 / 9368 / 9405 MB |
+| after | **882 / 870 / 878 MB** |
+
+**10.7×, unanimous, with under 40 MB of spread on either side.** Responses stay
+byte-identical — eight paths checked against a server serving the same site from
+disk — and a 0.5–3.4 MB page is returned in 0.7–6.8 ms.
+
+The cost is startup, and it is worth stating carefully because it is the side
+that argues against the change. Eight interleaved rounds gave a median of
+**+13%** (≈2 s on a 17–20 s startup) with six rounds slower, two faster, and one
+27 s outlier on a machine under load. The sign is not unanimous, so the honest
+figure is "about two seconds", not a percentage — and it agrees with the
+arithmetic: 9 GB at zstd-1 across eleven usable cores is ~2 s. On a 4000-page
+site with 200 MB of output there is no measurable cost at all (296/288/324 ms
+against 305/450/296 ms) and memory goes 220 → 208 MB.
+
+Two seconds once, against 8.5 GB held for the life of the process.
+
+PERF-016 is marked partial rather than closed: **render-on-demand is still the
+right answer** and would take the map to nothing at all — though see the
+decomposition below for what that is actually worth. Compression moved
+the wall from ~20k pages to ~200k on a 24 GB machine, which buys enough room
+that the architectural change can wait for someone who needs it.
+
+**What that leaves for render-on-demand, stated properly.** The two serve figures
+decompose it: the compressed map costs **878 − 289 = 589 MB**, and the remaining
+289 MB is the `Library`, the `RenderCache`, Tera and the runtime, which a request
+still needs. So rendering on demand would remove 67% of what `serve` holds and
+land at roughly **289 MB — which is where `--store-html` already is today**. The
+remaining prize is getting that figure without writing the site to disk, not
+taking `serve` to nothing. Worth saying because "would take the map to nothing"
+is true of the map and misleading about the process.
+
+### PERF-015 — the filesystem probing behind template file lookups (rejected)
+
+`search_for_file` resolves a path by probing up to five locations, and
+`is_path_in_directory` canonicalizes *both* the candidate and the site root —
+the site root being a constant it re-resolves on every call. Together they are
+0.9% of the build: `canonicalize` 360 ms and `stat` 439 ms of self time, the
+latter covering every stat in the build.
+
+**Rejected on analysis, without writing the change.** Three findings from reading
+the code closed it:
+
+1. **The original entry misattributed the cost.** The containment check runs
+   *only* when the requested path exists directly under the site root
+   (`helpers.rs:39`, guarded by the direct probe; the fallback loop at `:43-53`
+   has no containment check at all). So `get_url(path='css/main.css',
+   cachebust=true)` canonicalizes **nothing** — `css/` resolves out of `static/`
+   at location 2. What actually pays is `load_data`, because Zola's convention
+   puts `data/` at the site root: 55 of the reference site's 61 `load_data` call
+   sites resolve on the direct probe, three of them in `base.html`, so ~11 300
+   invocations and ~22 600 `realpath` walks from that one template.
+2. **The safe subset is unmeasurable.** Caching the canonicalized root is safe —
+   per instance and lazily, never a process-global, because the site tests build
+   many roots concurrently and some construct `LoadData` with an empty
+   `PathBuf` that `canonicalize` would reject. But in the CLI the base path is
+   *already canonical* before `Site::new` sees it (`src/main.rs:126`), so that
+   call resolves an already-resolved path: it is the cheap half of the two. The
+   change is worth at most ~0.5% of CPU, and PERF-013 established that ~1% is
+   below the noise floor of a whole-build A/B on this machine.
+3. **A resolution memo would be wrong, not just risky.** `ChangeKind::StaticFiles`
+   copies a changed file without calling `recreate_site()`
+   (`src/cmd/serve.rs:857-861`), so the function instances outlive additions to
+   `static/` during a serve session. A memoized *negative* result would stay
+   wrong until an unrelated full rebuild.
+
+The one change that would show in a profile — deleting both `canonicalize` calls
+in favour of a lexical containment check — is worth ~1% and is a semantics change
+to symlink handling. It should be argued on correctness grounds, not smuggled in
+under a perf item. See the note below on why that guard is weaker than it looks.
+
+### The containment guard does not hold (not a performance item)
+
+Found while analysing PERF-015, verified by running it, and recorded here because
+it bears on any attempt to "optimize" the guard.
+
+`search_for_file` checks that a resolved path is inside the site directory —
+`"{:?} is not inside the base site directory"` — but only on the direct probe.
+The four fallback locations are unchecked, so a `..` path that misses the direct
+probe and hits a fallback escapes. Reproduced on a scratch site: with the root at
+`<tmp>/a/b/site` and a file at `<tmp>/a/b/secret`,
+
+```
+{{ load_data(path="../../secret", format="plain") }}
+```
+
+resolves `<root>/static/../../secret`, reads the file and renders its contents
+into the output. No error.
+
+**This is upstream behaviour**, reproduced identically on the baseline binary
+`9ec4407a` (upstream 0.23.3 + instrumentation) and on this fork. It is not a
+remote-attacker vector — it needs control of the site's templates — but it is a
+boundary Zola states it enforces, and it matters for third-party themes and for
+anything that builds untrusted sites. Two other routes bypass it as well: the
+fallback locations are unchecked for symlinks, and `copy_directory` follows
+symlinks when publishing `static/` (`utils/src/fs.rs:107-110`).
+
+Filed as [korczis/zola#1](https://github.com/korczis/zola/issues/1) against this
+fork, at the owner's direction, rather than reported upstream: this fork is
+being separated from `getzola/zola` and will be maintained as its own project.
+
+A note on how this was handled, because the sequence was not ideal. It was
+described as "not filed anywhere public" while this text — including the
+reproduction — was already committed and pushed to a public repository. The
+finding was public the moment it landed here; the disclosure question was
+narrower than it looked, and was really only about whether to notify upstream.
+
+### PERF-014 — minify-html seeds a hasher per tag (P3, upstream)
+
+`gen_hasher_seed` is 1.9 s of self CPU on the reference site and 1825 of its 1898
+samples come from `minify_html::parse::element::parse_tag`: the minifier builds a
+randomly-seeded ahash map for each tag's attributes. On pages of a few kilobytes
+this is invisible; at 1.6 MB per page it is 2.2% of the build.
+
+Nothing to do here without patching a second dependency, which is not worth it
+for 2%. Recorded so the symbol is not re-investigated: it is not Zola's hashing,
+and it is not the `preserve_order` change.
 
 ## What is explicitly *not* a hotspot
 
@@ -258,3 +548,8 @@ Recorded so future work does not re-litigate these:
 5. **PERF-006** — unlocks the remaining sequential chunk of `load`.
 6. **PERF-002** — largest CPU item overall, but needs dependency-level design.
 7. **PERF-007**, then re-profile before touching anything in P2/P3.
+
+That order was followed. PERF-003, PERF-004 and PERF-007 were all rejected on
+measurement; the wins came from PERF-005a, PERF-002, PERF-010, PERF-001,
+PERF-006, and then from two things this list did not predict — output
+determinism and the allocator (PERF-012).

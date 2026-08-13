@@ -14,6 +14,8 @@ include = ["src/**/*", "LICENSE", "README.md"]
 
 [workspace]
 members = ["components/*"]
+# Patched dependency carried in-tree until the fix is released; see vendor/README.md.
+exclude = ["vendor/giallo"]
 
 [workspace.package]
 version = "0.23.3"
@@ -43,6 +45,8 @@ mime_guess = "2.0"
 # For essence_str() function, see https://github.com/getzola/zola/issues/1845
 mime = "0.3.16"
 env_logger = { version ="0.11", default-features = false }
+# Global allocator; see the `mimalloc` feature below.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 site = { workspace = true }
 errors = { workspace = true }
@@ -71,12 +75,18 @@ url = { workspace = true }
 same-file = "1"
 
 [features]
+default = ["mimalloc"]
 indexing-zh = ["search/indexing-zh"]
 indexing-ja = ["search/indexing-ja"]
 # Developer diagnostic: wraps the system allocator to count allocations and
 # bytes per build phase, reported by `zola build --timings`. Off by default;
 # enabling it slows the binary down and must never be used for timing runs.
 alloc-stats = []
+# Use mimalloc as the global allocator instead of the platform's. On by default:
+# it costs nothing on small sites and is worth ~24% of build CPU on a site with
+# large pages (docs/performance/OPTIMIZATIONS.md, PERF-012). Disable with
+# `--no-default-features` if a platform's own allocator is preferred.
+mimalloc = ["dep:mimalloc"]
 
 [workspace.dependencies]
 # External dependencies
@@ -113,13 +123,14 @@ serde_yaml = "0.9"
 sha2 = "0.11"
 slug = "0.1"
 svg_metadata = "0.6"
-tera = {version = "2.0.0", features = ["fast", "glob_fs"] }
+tera = {version = "2.0.0", features = ["fast", "glob_fs", "preserve_order"] }
 time = "0.3"
 toml = "0.9"
 unic-langid = "0.9"
 unicode-segmentation = "1.2"
 url = "2"
 walkdir = "2"
+zstd = "0.13"
 webp = "0.3"
 giallo = {version = "0.5", features = ["dump"]}
 insta = "1"
@@ -160,3 +171,9 @@ strip = false
 [package.metadata.winres]
 OriginalFilename = "zola.exe"
 InternalName = "zola"
+
+# giallo serialises all syntax highlighting on one mutex; the copy in vendor/
+# gives each thread its own regset. Remove this once a release contains the
+# fix - vendor/README.md has the steps.
+[patch.crates-io]
+giallo = { path = "vendor/giallo" }

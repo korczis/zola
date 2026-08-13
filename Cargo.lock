@@ -1715,8 +1715,6 @@ dependencies = [
 [[package]]
 name = "giallo"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "019550a7656d0e9fd71fe163b491ae053ee252d8761f0c55787bdfb393aca7c9"
 dependencies = [
  "bitcode",
  "onig-regset",
@@ -2535,6 +2533,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libwebp-sys"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2869,6 +2876,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "mime"
@@ -4979,6 +4995,7 @@ dependencies = [
  "url",
  "utils",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]
@@ -5253,6 +5270,7 @@ checksum = "638c0720e7c1f61722366256d369ea46139634e77738735d6d9bb287bbbad35f"
 dependencies = [
  "ahash 0.8.12",
  "globset",
+ "indexmap 2.14.0",
  "itoa",
  "pulldown-cmark-escape",
  "serde",
@@ -6407,6 +6425,7 @@ dependencies = [
  "globset",
  "link_checker",
  "log",
+ "mimalloc",
  "mime",
  "mime_guess",
  "notify-debouncer-full",

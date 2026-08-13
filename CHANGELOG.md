@@ -1,5 +1,85 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- Builds are now reproducible: maps reaching templates (`page.taxonomies`,
+  `page.extra`, `load_data` results, …) iterate in a stable order instead of a
+  per-process random one, so two runs of the same binary produce identical
+  output. Templates that iterate a map will see a fixed order where they
+  previously saw an arbitrary one; `page.taxonomies` is now sorted by name.
+  Only the order changes — never which entries are present.
+
+### Performance
+
+Measured on a 12-core machine, interleaved release builds, with byte-identical
+output verified for each change. Details and the rejected experiments are in
+`docs/performance/OPTIMIZATIONS.md`.
+
+- Much lower memory on large sites: the render cache no longer re-serializes
+  each page's value into its section and into every taxonomy term it belongs
+  to. Peak memory drops 72–86% (a 16 000-page site goes from 5.1 GB to 0.74 GB,
+  ~330 KB per page to ~46 KB) and builds get 18–25% faster.
+- Syntax highlighting is parallel again. It shared one Oniguruma regset behind
+  a mutex, so the markdown phase was slower on twelve threads than on one;
+  each thread now gets its own. Code-heavy sites build up to 64% faster. This
+  lives in the highlighting crate and is carried here as `vendor/giallo` until
+  it is released upstream.
+- `load_data` no longer holds its cache lock while reading and parsing, so
+  sites that load a data file per page stop serialising on it (−23% on a
+  data-heavy site).
+- The highlighting registry is shared rather than deep-copied into four Tera
+  functions: about 100 MB less on every build.
+- The content walk reads each directory once instead of twice (−35% on the
+  discovery phase of section-dense sites).
+- mimalloc is now the global allocator. Sites with large pages spend a quarter
+  of their build inside the platform allocator, churning multi-megabyte strings
+  through render and minify on every thread: −24% build CPU and −10% peak
+  memory on a site averaging 1.6 MB per page. Sites with small pages see no
+  change either way. Build with `--no-default-features` to keep the platform
+  allocator.
+
+### Fixed
+
+- `zola serve --output-dir <dir>` failed every rebuild after the first with
+  `Directory '<dir>' already exists. Use --force to overwrite.`, while still
+  reporting `Done in 23ms` and serving the previous build. The startup guard
+  against clobbering a directory was being re-asked on every rebuild, by which
+  point the server itself had filled it.
+- `zola serve --fast` applied nothing. A content change was detected and
+  re-parsed, the render job ran, and the server kept returning the page as it
+  was before the edit — reporting `Done in 0ms` while doing so. Rendering reads
+  its values from the render cache, which the fast path never refreshed. A
+  content edit on a 4000-page site now takes 34–41 ms, against 447–481 ms for
+  the full rebuild `serve` performs without `--fast`. As before, `--fast` only
+  re-renders the changed page or section: listings, taxonomies and feeds that
+  embed it still need a full rebuild.
+
+### Changed
+
+- `zola serve` compresses the rendered pages it holds in memory. Serving a site
+  cost as much RAM as its entire output — 9.4 GB on a site with 9 GB of HTML,
+  against 493 MB to build the same site. Pages of a template-driven site are
+  mostly the same bytes as themselves, so this costs **0.88 GB instead of
+  9.4 GB** (10.7×) with byte-identical responses and no change in behaviour. A
+  0.5–3.4 MB page is served in 0.7–6.8 ms. The cost is about two seconds of
+  startup on a site that size, and nothing measurable on a 4000-page one.
+- `zola serve --store-html` now serves the HTML from the output folder instead of
+  also keeping a copy in memory. Serving from memory costs as much RAM as the
+  site's entire output: 9248 MB on a site with 9 GB of HTML, against 289 MB with
+  this flag — and the request handler already fell back to the output directory,
+  so the second copy bought nothing. Responses are byte-identical. The trade is
+  that a full rebuild pays for writing the files (1.3–1.5 s against 0.45 s at
+  4000 pages) and that responses carry `Access-Control-Allow-Origin: *`, as
+  everything served from disk always has. Plain `zola serve` is unchanged.
+
+### Added
+
+- `zola build --timings` prints a per-phase breakdown of the build, with
+  per-item costs for the parallel phases. It is a developer diagnostic; a build
+  without the flag pays one relaxed atomic load per instrumentation point.
+
 ## 0.23.3 (2026-08-11)
 
 - Fix Windows issues

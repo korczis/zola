@@ -93,3 +93,762 @@ PERF-006 (serial discovery).
 * Output equivalence, `data-heavy-4000` (4205 files): **IDENTICAL**
 
 **Commit.** `perf(PERF-001): don't hold the load_data cache lock across I/O`
+
+---
+
+## Output determinism — a prerequisite for the equivalence gate (not a PERF item)
+
+**Problem.** Two runs of the *same* binary produced different HTML.
+`compare_output.py --baseline X --candidate X` on `mixed-realistic-1000`
+reported 484 of 1547 files changed. The mandatory output-equivalence gate was
+therefore meaningless for any site with more than one taxonomy on a page.
+
+**Cause.** Two layers of hash-ordered maps:
+
+1. `PageFrontMatter.taxonomies` was a `std::collections::HashMap`, and
+2. `tera::Map` is a `HashMap` unless the `preserve_order` feature is enabled.
+
+Templates iterate both directly (`{% for name, terms in page.taxonomies %}`),
+so the order came from a per-process random hash seed.
+
+**Change.** `taxonomies` becomes a `BTreeMap`, and Zola enables tera's
+`preserve_order` feature so every `Value` map keeps insertion order. Both are
+needed: the feature alone would still preserve a random insertion order.
+
+**Test.** `render::cache::tests::taxonomies_serialize_in_a_stable_order` builds
+a cache for a page with 20 taxonomies and asserts sorted key order. It fails
+without the change (verified by toggling the feature off) and passes with it.
+An earlier 3-key version of the same test passed by luck — recorded here
+because it is exactly the trap this gate exists to avoid.
+
+**Output impact.** This change is *about* output, so byte-equality with the
+previous binary is not expected. On `mixed-realistic-1000`, 487 of 1547 files
+differ — and all 487 contain **exactly the same characters** as before, i.e.
+the difference is purely reordering. No file is added or removed.
+
+**Performance (interleaved, `mixed-realistic-4000`):**
+
+| round | before | after |
+| ----- | ------ | ----- |
+| 1 | 2.71 s | 2.51 s |
+| 2 | 2.19 s | 2.07 s |
+| 3 | 2.37 s | 2.15 s |
+| median | 2.37 s | **2.15 s (−9%)** |
+
+Peak RSS: **384 MB → 326 MB (−15%)**. `IndexMap` iterates contiguously and
+stores entries more compactly than the hash map it replaces, so the fix is
+faster and smaller as well as correct.
+
+**Gates.** `scripts/dev.sh quality`: ALL PASS (fmt, clippy ratchet,
+461 tests).
+
+---
+
+## Rejected experiment: caching created directories (hotspot PERF-003)
+
+**Hypothesis.** `write_output` calls `fs::create_dir_all` once per rendered
+output; the CPU profile attributed 18.9% of busy samples on
+`simple-pages-1000` (and 1237 ms of `mkdir` on `mixed-realistic-4000`) to it.
+Remembering the directories already created should remove those syscalls.
+
+**Implementation tried.** An `Arc<Mutex<AHashSet<PathBuf>>>` on `Queue`,
+checked before `create_dir_all` and updated after; the lock is held only for
+the hash lookup.
+
+**Result — no improvement.** Write-phase CPU (`out: write file` accumulator,
+`simple-pages-4000`, interleaved):
+
+| round | without | with |
+| ----- | ------- | ---- |
+| 1 | 8.84 s | 7.00 s |
+| 2 | 7.71 s | 7.67 s |
+| 3 | 7.71 s | 7.98 s |
+| median | 7.71 s | 7.67 s |
+
+Whole-build wall time was likewise indistinguishable (median 1.31 s vs 1.39 s,
+with a 1.03–1.37 s spread on the *same* binary). The mutex costs roughly what
+the skipped `mkdir` calls save.
+
+**Second variant, also rejected.** The thread-local set (no shared lock, a few
+duplicate `mkdir` calls across workers) was implemented and measured after
+PERF-005a and PERF-010 had made the write path the largest remaining item —
+`out: write file` was then 7.0 s of CPU across 4804 writes, 1.4 ms each:
+
+| round | `out: write file`, without | with | wall without | wall with |
+| ----- | -------------------------- | ---- | ------------ | --------- |
+| 1 | 6.989 s | 7.107 s | 1.55 s | 1.63 s |
+| 2 | 7.116 s | 6.935 s | 1.68 s | 1.65 s |
+| 3 | 7.079 s | 7.440 s | 1.73 s | 1.65 s |
+| median | 7.079 s | 7.107 s | 1.68 s | 1.65 s |
+
+No effect either. **PERF-003 is closed as rejected**: the cost in the write
+path is the file creation and write themselves, not the redundant `mkdir`
+calls, and `mkdir` returning `EEXIST` on APFS is cheap enough that removing it
+is unmeasurable. The CPU profile's 18.9% attribution to `create_dir_all` on
+`simple-pages-1000` counted samples in the kernel while other workers were
+parked, and overstated the share of wall time it could return.
+
+---
+
+## PERF-005a — stop re-serializing page values into sections and taxonomies
+
+**Problem.** `RenderCache::build` embedded already-built page values into their
+section and into every taxonomy term by handing them to
+`Value::from_serializable`. That function walks a structure through serde and
+rebuilds every map, key and string it meets — including `Value`s that were
+already built — so a page belonging to a section and four taxonomy terms was
+materialised five extra times, each copy carrying the page's full rendered HTML.
+
+**Evidence (before).** `build render cache` was 24.3% of wall time on
+`mixed-realistic-4000` while running single-threaded, allocated 7.4–10 M times
+(963 MB–1.2 GB) and accounted for ~86% of the peak heap. A controlled
+experiment showed each additional taxonomy membership cost ≈67 KB of retained
+heap and ≈60 ms per 2000 pages — see `ALLOCATIONS.md`.
+
+**Change.** `components/render/src/cache.rs`: serialize the section / term /
+taxonomy struct with an *empty* placeholder for its child collection, then
+replace that entry with the `Value`s already in hand. `tera::Value` is
+`Arc`-backed, so this is a refcount bump instead of a deep copy. The
+placeholder means the key already exists, and re-inserting an existing key in
+an order-preserving map keeps its position — so field order, and therefore the
+bytes templates produce, are unchanged.
+
+**Results.**
+
+`build render cache` phase (`--timings`, `many-taxonomies-4000`):
+
+| round | before | after |
+| ----- | ------ | ----- |
+| 1 | 344.6 ms | 22.2 ms |
+| 2 | 349.7 ms | 22.4 ms |
+| 3 | 339.8 ms | 22.4 ms |
+| median | 344.6 ms | **22.4 ms (−94%, 15× faster)** |
+
+Wall time, interleaved:
+
+| site | before (median) | after (median) | change |
+| ---- | --------------- | -------------- | ------ |
+| `many-taxonomies-4000` | 2.08 s | 1.58 s | **−24%** |
+| `mixed-realistic-4000` | 2.04 s | 1.61 s | **−21%** |
+| `mixed-realistic-16000` | 8.06 s | 6.49 s | **−19%** |
+
+Peak RSS:
+
+| site | before | after | change |
+| ---- | ------ | ----- | ------ |
+| `many-taxonomies-4000` | 1303 MB | 273 MB | **−79%** |
+| `mixed-realistic-4000` | 1108 MB | 312 MB | **−72%** |
+| `mixed-realistic-16000` | 4070 MB | 741 MB | **−82%** |
+
+The memory scaling wall identified in `SCALING.md` is gone: a 16k-page site
+that needed 4.1 GB now needs 741 MB, so per-page cost drops from ~330 KB to
+~46 KB.
+
+**PERF-005b (parallelising the phase) is no longer worth doing**: the phase it
+would parallelise now takes 22 ms.
+
+**Correctness.**
+
+* output equivalence **IDENTICAL** on `many-taxonomies-2000` (2269 files),
+  `mixed-realistic-1000`, `deep-sections-1000`, `dense-internal-links-1000`;
+* `scripts/dev.sh quality`: ALL PASS (fmt, clippy ratchet, 461 tests).
+
+**Commit.** `perf(PERF-005a): reuse cached page values instead of re-serializing them`
+
+---
+
+## Rejected experiment: parallel output cleaning (hotspot PERF-004)
+
+**Hypothesis.** `clean_site_output_folder` deletes the previous output with a
+single-threaded `remove_dir_all`; it is 36% of wall time on the reference
+workload (663 ms for 6544 files / 73 MB, and 1.3 s once the site grew to 9 GB).
+The top-level entries are independent subtrees, so deleting them with rayon
+should shorten the phase.
+
+**Result — slower.** `clean output dir` phase, interleaved (the first round of
+each pair cleans an empty directory and is excluded):
+
+| site | serial | parallel |
+| ---- | ------ | -------- |
+| reference proxy | 3.889 s | 6.784 s |
+| reference proxy | 3.457 s | 2.797 s |
+| `mixed-realistic-8000` | 978.9 ms | 1.856 s |
+
+Whole-build wall on the reference proxy was 26.5–33.8 s serial against
+31.6–35.1 s parallel. Two of three phase samples and all three whole-build
+samples were worse.
+
+**Why.** APFS serialises directory-metadata mutations; concurrent `unlink`
+storms contend rather than overlap. Parallelism is not the lever here.
+
+**Second variant — rename aside, delete in the background — also rejected.**
+Approved and implemented: the previous output is renamed to a sibling scratch
+directory (one `rename`, regardless of size), deleted on a background thread
+while the build runs, and joined before the build reports success. It worked
+exactly as designed at the phase level, on the reference workload:
+
+| phase | before | after |
+| ----- | ------ | ----- |
+| `clean output dir` | 929.8 ms | 0.2 ms (rename) |
+| `wait for background clean` | — | 0.0 ms |
+
+**And it made no difference to wall time.** Interleaved:
+
+| site | before (median) | after (median) |
+| ---- | --------------- | -------------- |
+| reference proxy (9 GB output) | 24.42 s | 24.55 s |
+| `mixed-realistic-8000` | 3.19 s | 3.33 s |
+| `markdown-heavy-4000`, 8 rounds | 4.275 s | 4.350 s (+1.8%; min −0.7%) |
+
+`markdown-heavy-4000` is the case that should have shown it most clearly: the
+clean is 301 ms of a 4.3 s build (7.1%), the build is CPU-bound, and the run
+spread was tight (4.22–4.40 s). The effect is absent.
+
+**Why.** The deletion is not removed, only moved. The build already saturates
+all 12 cores and the same disk, so a background deleter competes with the
+workers for exactly the resources they need; total work is conserved. Winning
+would require not waiting for the deletion at all — detaching it from the
+process lifetime — which would let `zola build` return while it is still
+writing to disk, and race with whatever consumes the output next.
+
+**Not committed.** What was kept is this record: the clean phase can be made to
+disappear from the timeline, and doing so buys nothing on a machine where the
+build is already the bottleneck. PERF-004 is closed as rejected.
+
+---
+
+## PERF-006 — one directory read per directory during discovery
+
+**Problem.** The content walk visited every directory twice. The outer
+`WalkDir` yielded each entry, and then for every directory a *second*
+`WalkDir` with `max_depth(1)` was started just to find its `_index.*` files.
+Each file also paid a `path.is_dir()` `stat` that the directory read had
+already answered.
+
+**Change.** `components/site/src/lib.rs`: use the `file_type` the walk already
+carries instead of `path.is_dir()`, and replace the nested `WalkDir` with a
+plain `read_dir` that only stats the handful of `_index.*` candidates (kept, so
+a symlinked index file still resolves — issue #1244). `read_dir` order is
+filesystem-defined while the previous walk was sorted, and section insertion
+order is observable through error ordering, so the candidates are sorted
+explicitly.
+
+**Results.** `discover + parse sections` phase, interleaved:
+
+| site | before (median) | after (median) | change |
+| ---- | --------------- | -------------- | ------ |
+| `deep-sections-8000` (4000 sections) | 82.0 ms | 53.7 ms | **−35%** |
+| reference proxy (1640 sections, 5416 files) | 195.5 ms | 200.4 ms | no change |
+
+The reference proxy sees nothing: its discovery cost is reading and parsing
+1640 `_index.md` files, not walking directories. On a section-dense tree the
+saving is real and reproducible (3 of 3 rounds), but it is ~1% of that build's
+wall time — this is a syscall reduction, not a headline win, and it is recorded
+as such.
+
+**Correctness.** Output equivalence IDENTICAL on `deep-sections-1000`,
+`mixed-realistic-1000`, `simple-pages-1000`, `many-taxonomies-2000` and the
+reference proxy. `scripts/dev.sh quality`: ALL PASS.
+
+**Commit.** `perf(PERF-006): read each content directory once during discovery`
+
+---
+
+## Cumulative effect so far (superseded — see "The whole program, measured in one session" at the end)
+
+Measured with the binary from the start of this round of work (PERF-001 and the
+`--timings` instrumentation, commit `71be7609`) against the current tree
+(determinism fix + PERF-005a + PERF-006). Interleaved, on a machine with free
+disk — an earlier attempt at this table was invalidated when 9 GB output trees
+filled the disk and builds began failing, which is recorded here because the
+numbers looked spectacular and were meaningless.
+
+| workload | before (median) | after (median) | wall | peak RSS before → after |
+| -------- | --------------- | -------------- | ---- | ----------------------- |
+| `mixed-realistic-4000` | 2.10 s | 1.72 s | **−18%** | 1371 MB → 311 MB (**−77%**) |
+| `many-taxonomies-4000` | 2.21 s | 1.65 s | **−25%** | 1696 MB → 273 MB (**−84%**) |
+| `mixed-realistic-16000` | 8.67 s | 6.80 s | **−22%** | 5152 MB → 742 MB (**−86%**) |
+| reference proxy (3776 pages, 9 GB output) | 28.9 s | 24.6 s | **−15%** | — |
+
+Against Zola 0.22 the reference site went from 252 s to ~25 s, though that
+comparison also includes the 0.22→0.23 engine work and the template migration
+(see `REAL-SITE.md`).
+
+**Open, in priority order:** PERF-002 (highlighting serialized on giallo's
+`RegSet` mutex — the largest remaining CPU item on sites with code blocks),
+PERF-004 (output cleaning; parallel deletion was measured and rejected, the
+rename-aside approach needs a decision), PERF-003 (the thread-local variant),
+PERF-007, PERF-009, PERF-010.
+
+---
+
+## PERF-010 — share the highlighting registry instead of deep-copying it
+
+**Problem.** `register_early_global_fns` clones `Config` into four Tera
+functions (`get_url`, `trans`, `text_direction`, the `markdown` filter).
+`Config` owns the giallo `Registry`, and `Registry::clone` deep-copies every
+grammar, theme and injection — `ALLOCATIONS.md` measured the registry at ~23 MB
+retained, and the phase at 1.1 M allocations / 132 MB with ~92 MB of that never
+released. None of the copies is ever used to highlight anything: highlighting
+goes through the `Config` the markdown renderer borrows.
+
+**Change.** `components/config/src/config/markup.rs`: `Highlighting.registry`
+becomes `Arc<Registry>`. Cloning a `Config` is then a refcount bump. Nothing
+else changes — `Registry`'s methods are reached through `Deref`, and the
+registry is still built (and mutated with extra grammars and themes) before it
+is wrapped.
+
+**Results.**
+
+`register tera fns (early)` phase, `mixed-realistic-4000`, interleaved:
+
+| round | before | after |
+| ----- | ------ | ----- |
+| 1 | 40.3 ms | 0.6 ms |
+| 2 | 41.1 ms | 0.6 ms |
+| 3 | 41.5 ms | 0.6 ms |
+
+Peak RSS:
+
+| site | before | after | change |
+| ---- | ------ | ----- | ------ |
+| `simple-pages-1000` | 184 MB | 86 MB | **−53%** |
+| `mixed-realistic-4000` | 312 MB | 209 MB | **−33%** |
+| `markdown-heavy-2000` | 392 MB | 291 MB | **−26%** |
+
+A flat ~100 MB saving on every build, which is most of the remaining baseline
+footprint on small sites.
+
+**Correctness.** Output equivalence IDENTICAL on `mixed-realistic-1000` and
+`markdown-heavy-1000` (the scenario that actually highlights).
+`scripts/dev.sh quality`: ALL PASS.
+
+**Commit.** `perf(PERF-010): share the highlighting registry behind an Arc`
+
+---
+
+## PERF-002 — fixed upstream in giallo: a RegSet per thread
+
+**Problem.** `PatternSet` (`giallo/src/grammars/pattern_set.rs`) held
+`Option<Mutex<RegSet>>`, because `onig_regset_search` writes to the regset's
+internal region storage and one instance cannot be searched concurrently.
+Pattern sets are handed out as `Arc` from the registry's cache, so every worker
+highlighting the same language queued behind a single lock. Highlighting did
+not parallelise at all: the markdown phase took **1.58 s on one thread and
+1.69 s on twelve**.
+
+**Change.** Keep the pattern strings in the `PatternSet` and compile a `RegSet`
+per thread on first use, in a thread-local map keyed by a per-pattern-set id.
+Only a thread that actually searches a set pays for a copy. The patch is
+`docs/performance/giallo-thread-local-regset.patch`, applied to
+`getzola/giallo@5e19db8` and measured through Zola with
+`[patch.crates-io] giallo = { path = … }`.
+
+**Results.** `render markdown` phase and whole-build wall time, interleaved:
+
+| site | md phase before | md phase after | wall before | wall after |
+| ---- | --------------- | -------------- | ----------- | ---------- |
+| `markdown-heavy-2000` | 1.690 s | 0.284 s (**−83%**) | 2.25 s | **0.87 s (−61%)** |
+| `markdown-heavy-4000` | 3.082 s | 0.505 s (**−84%**) | 4.23 s | **1.67 s (−61%)** |
+| `template-heavy-4000` | 268.3 ms | 63.0 ms (−77%) | 1.40 s | 1.17 s (−16%) |
+| `mixed-realistic-4000` | 273.0 ms | 68.4 ms (−75%) | 1.57 s | 1.38 s (−12%) |
+
+Thread scaling of the markdown phase on `markdown-heavy-2000` — the measurement
+that showed the bug in the first place:
+
+| threads | before | after |
+| ------- | ------ | ----- |
+| 1 | 1.58 s | 1.58 s |
+| 2 | ~1.6 s | 0.94 s |
+| 4 | ~1.6 s | 0.56 s |
+| 12 | 1.69 s | **0.27 s** (5.9×, efficiency 0.49) |
+
+Peak RSS grows by **5–8 MB** (292 → 297 MB on `markdown-heavy-2000`), not the
+~270 MB the per-thread-*registry* workaround would have cost: only the pattern
+sets a thread actually uses are compiled, and a compiled regset is small next to
+the grammar data.
+
+**Correctness.** Output equivalence IDENTICAL against the unpatched binary on
+`markdown-heavy-1000`, `markdown-heavy-4000`, `template-heavy-1000` and
+`mixed-realistic-1000`; the patched binary also agrees with itself run to run.
+giallo's own test suite is unchanged by the patch: 46 pass and 11 fail both
+before and after, all 11 for missing grammar/theme fixtures that the repository
+does not ship.
+
+**Shipped by vendoring.** `vendor/giallo` carries `getzola/giallo@5e19db8` plus
+this patch, pulled in through `[patch.crates-io]` in the root `Cargo.toml`;
+`vendor/README.md` records where it came from and how to remove it. Confirmed
+with that copy in place: `markdown-heavy-4000` 6.24 s → 2.23 s (−64%), peak RSS
+514 → 522 MB, output IDENTICAL on `markdown-heavy-1000`,
+`mixed-realistic-1000` and `template-heavy-1000`.
+
+The patch still wants to go upstream — vendoring is how the fix is available
+now, not where it belongs. Known limitation, stated in the patch: thread-local entries live until the
+thread exits, so a process that keeps building registries (`zola serve`
+reloading a config) grows the map. Storing a `thread_local::ThreadLocal<RegSet>`
+inside `PatternSet` would tie the storage to the object's lifetime instead, at
+the cost of one dependency — the maintainer's call.
+
+**Commit.** `perf(PERF-002): vendor giallo with a RegSet per thread`
+
+### PERF-002 without touching giallo — measured, and the trade-off
+
+The same win is reachable from inside Zola: `Registry` is `Clone`, and cloning
+starts a fresh pattern cache while keeping the same `Scope` ids (so the global
+scope repository stays valid — unlike `Registry::load`, which replaces it).
+A `thread_local` clone per worker, made lazily on that worker's first
+highlight, gives every thread its own regsets.
+
+Implemented and measured (three-way, interleaved, medians):
+
+| workload | today | Zola-side per-thread `Registry` | patched giallo |
+| -------- | ----- | ------------------------------- | -------------- |
+| `markdown-heavy-2000` wall | 2.73 s | 1.07 s | 1.02 s |
+| `markdown-heavy-4000` wall | 5.20 s | 1.80 s | 1.83 s |
+| `mixed-realistic-4000` wall | 1.71 s | 1.63 s | 1.55 s |
+| `markdown-heavy-2000` RSS | 291 MB | **600 MB** | 297 MB |
+| `markdown-heavy-4000` RSS | 514 MB | **822 MB** | 521 MB |
+| `mixed-realistic-4000` RSS | 209 MB | **519 MB** | 216 MB |
+
+**It is as fast as the upstream fix and costs ~310 MB.** That is ~26 MB per
+worker: a cloned registry duplicates all the grammars, where the giallo patch
+duplicates only the compiled regsets a thread actually uses.
+
+Freeing the clones after the markdown phase (`rayon::broadcast` of a
+`clear_local_registries`) was also measured: it returns 36 MB of the 310
+(824 → 786 MB, 519 → 483 MB). The peak is reached during highlighting itself and
+the allocator keeps the pages, so the machinery does not pay for itself.
+
+Output is byte-identical either way.
+
+**Not committed**, because handing back 310 MB undoes most of what PERF-005a and
+PERF-010 won and the choice is a trade, not an improvement. The three ways to
+get the fix, in order of preference:
+
+1. **Upstream giallo** — `docs/performance/giallo-thread-local-regset.patch`
+   applies to `getzola/giallo@5e19db8`; Zola then bumps the dependency. Best
+   result, no cost to Zola, needs a release.
+2. **Vendor or fork the patched crate** and point at it with
+   `[patch.crates-io] giallo = { path = … }` or a git revision. Same result
+   today, at the cost of carrying ~10k lines and a 1.2 MB `builtin.zst` in the
+   repository until upstream releases.
+3. **The Zola-side per-thread registry above** — no dependency change, ~30
+   lines, same speed, +310 MB.
+
+---
+
+## PERF-012 — mimalloc as the global allocator
+
+**Problem.** A CPU profile of the reference site (3776 pages, 1.6 MB of HTML
+per page) put **34 s of 138 s of busy CPU inside the platform allocator**:
+
+| symbol (self time) | ms |
+| ------------------ | -- |
+| `_xzm_free` | 14 182 |
+| `xzm_malloc` | 5 837 |
+| `_xzm_xzone_malloc` | 4 651 |
+| `_malloc_zone_malloc` | 3 748 |
+| `_xzm_xzone_malloc_tiny` | 2 847 |
+| `_free` | 2 822 |
+
+That is macOS 15's xzone allocator, and the shape of the workload is the worst
+case for it: twelve rayon workers each build a multi-megabyte `String`, hand it
+to the minifier, which allocates another one, then drop both — a stream of large
+allocations with no reuse between them.
+
+**Change.** `mimalloc` as `#[global_allocator]` in the binary, behind a
+default-on `mimalloc` feature. No library code changes; `--no-default-features`
+restores the platform allocator, and `alloc-stats` still overrides it.
+
+**Results.** Interleaved, five rounds, `scripts/perf/ab.py`. CPU time is the
+headline figure rather than wall: these builds write 9 GB per run, and the
+filesystem stalls that causes move wall time around by several seconds in both
+directions without saying anything about the code.
+
+Reference site, per-round CPU (s), A = platform allocator, B = mimalloc:
+
+| round | A | B |
+| ----- | - | - |
+| 1 | 405.5 | 297.6 |
+| 2 | 361.0 | 288.2 |
+| 3 | 357.8 | 263.7 |
+| 4 | 351.9 | 268.5 |
+| 5 | 347.9 | 270.5 |
+
+**Paired median −23.7% CPU, unanimous across all five rounds.** Peak RSS
+−9.9% (574 → 513 MB). Wall was −20.9% at the median but one round disagreed on
+the sign, so the wall figure is reported as indicative.
+
+The synthetic scenarios, which have small pages, show **no CPU or wall effect at
+all** — every one of them has rounds disagreeing on the sign:
+
+| scenario | paired CPU | paired RSS |
+| -------- | ---------- | ---------- |
+| `mixed-realistic-16000` | −7.8% (not unanimous) | **−7.3%** |
+| `mixed-realistic-4000` | −1.2% (not unanimous) | +5.7% |
+| `data-heavy-4000` | +1.8% (not unanimous) | +4.2% |
+
+So this is a large-page win, not a general one: mimalloc's arenas cost ~11 MB on
+a 200 MB build and save 45 MB on a 620 MB one, and the CPU saving only appears
+once allocations are big enough to reach the platform allocator's slow path.
+The direction improves as sites grow, which is the workload this fork targets.
+
+**Portability.** The measurement is macOS-only, and the symbols it blames are
+macOS-specific; the win may be smaller or absent against glibc. Nothing
+regressed anywhere measured, so it is on by default rather than off. `mimalloc`
+was verified to compile and run against musl (static Alpine build) since
+`x86_64-unknown-linux-musl` is a release target; a C toolchain was already
+required by oniguruma, so this adds no build dependency.
+
+**Correctness.** Output equivalence IDENTICAL on `mixed-realistic-1000` and on
+the full 6592-file reference site. `scripts/dev.sh quality`: ALL PASS.
+
+**Commit.** `perf(PERF-012): use mimalloc as the global allocator`
+
+---
+
+## PERF-013 — hash each file once per build, not once per page
+
+**Problem.** `get_url(cachebust=true)` and `get_hash(path=…)` open, read and SHA
+their target on every call. Both are template functions, so a cachebusted
+`<link>` in a base template hashes the same file once per output. The reference
+site does this three times in `base.html` — one of them on the generated search
+index — across 5601 outputs: 2.2 s of `compute_hash` self CPU plus the reads
+feeding it.
+
+**Change.** A `FileHashes` memo in `templates/src/functions/files.rs`, one per
+`GetUrl`/`GetHash` (so one per build, since the functions are registered during
+`Site::load`), keyed by `(path, sha_type, base64)` and validated against the
+file's `(timestamp, length)`.
+
+The validation is not belt-and-braces. `search_for_file` also looks in the
+*output* directory, so a hashed file can be one the build itself writes; a
+path-only cache would be a correctness bug waiting for the day someone hashes a
+file that is generated later. Following PERF-001, the lock is held for the
+lookup and the insert only — never across the read.
+
+`GetHash` now reads its `sha_type`/`base64` kwargs before opening the file,
+since the memo cannot be looked up without knowing which hash was asked for.
+The one observable consequence: for a call that is *both* unreadable and has a
+malformed `sha_type` argument, the kwarg error now surfaces instead of the file
+error. "Cannot find file" still wins over both.
+
+**Results.** A whole-build A/B cannot resolve this: 2.2 s of CPU is ~1% of the
+reference build, and that session's paired CPU spread was 76 s because another
+program on the machine was using three cores. Reported as measured — five
+interleaved rounds gave −0.4% CPU with the rounds disagreeing on the sign, which
+is a non-result, not a win.
+
+What *can* be measured is the thing that changed. In a profile of the same site,
+`compute_hash` accounted for 2217 ms of self time before and **does not appear at
+all** after (top-40 by self time; the fortieth entry is 667 ms).
+
+So: a real but small saving, taken because it is also the correct thing to do —
+the previous code re-read a file up to 5601 times per build — and because it
+costs nothing.
+
+**Correctness.** Output equivalence IDENTICAL on the full 6592-file reference
+site (whose pages embed a cachebust hash of the search index) and on
+`mixed-realistic-1000`. `scripts/dev.sh quality`: ALL PASS. Two tests were added
+for the memo, one per failure mode it could have: that a hash flavour is part of
+the key, and that a rewritten file is noticed. The second was confirmed to fail
+when the `(timestamp, length)` check is removed.
+
+**Commit.** `perf(PERF-013): memoize file hashes for cachebust and get_hash`
+
+---
+
+## Rejected experiment: parallelising the static copy (hotspot PERF-007)
+
+**Hypothesis.** `copy_directory` walks and copies `static/` one file at a time.
+The reference site's tree is 989 files / 55 MB and the phase costs 170–190 ms of
+serial wall time. Copying the files with rayon after the (serial) walk should
+turn that into a fraction.
+
+**Change tried.** Collect the walk into a list of files, create the directories
+serially in walk order, then `par_iter()` the copies; collect all results and
+report the first failure in walk order so the error a user sees does not depend
+on scheduling. Also switched `entry.path().is_dir()` to `entry.file_type()` to
+drop a `stat` per entry.
+
+**Result: rejected — it is slower.**
+
+Reference site, `copy static` phase, alternating binaries:
+
+| round | serial | parallel |
+| ----- | ------ | -------- |
+| 1 | 191.0 ms | 193.6 ms |
+| 2 | 196.6 ms | 211.6 ms |
+| 3 | 211.0 ms | 170.9 ms |
+
+Nothing there: 55 MB in ~190 ms is ~290 MB/s, which is the disk, not the loop.
+
+So the experiment was repeated on the case parallelism should win — 5000 files
+of 1 KB each, where per-file syscall latency dominates and throughput does not:
+
+| round | serial | parallel |
+| ----- | ------ | -------- |
+| 1 | 640.1 ms | 837.6 ms |
+| 2 | 813.6 ms | 899.0 ms |
+| 3 | 841.9 ms | 1023 ms |
+
+**Unanimously worse, by 10–30%.** Twelve threads creating files in the same
+handful of directories contend on directory metadata — and each copy calls
+`create_parent`, so they also hammer `exists()` on the same paths at once.
+
+This is the third filesystem experiment in this program to fail this way, after
+caching created directories (PERF-003) and parallel output cleaning (PERF-004).
+The pattern is now established well enough to state as a rule: **on this
+platform, filesystem metadata operations do not parallelise — they
+anti-parallelise.** Bulk data throughput is the disk's business, and the loop
+around it is not what costs. Future proposals of this shape need a measurement
+first, not a review.
+
+The `file_type()` micro-fix went back with the revert: it removes a `stat` per
+entry, which is real but far below what this phase's noise can resolve, and it
+is not worth carrying a change no measurement supports.
+
+---
+
+## The whole program, measured in one session
+
+Every table above compares one change against the tree that preceded it. This
+one compares **the binary this program started from against the binary it ended
+with**, in a single interleaved session, on the same machine, at the same time —
+which is the only comparison that can honestly be called "what the program
+bought".
+
+It exists because the previous headline table did not meet that standard: its
+"before" and "after" columns came from measurements taken in different sessions,
+weeks apart, some of them on a loaded machine. That is exactly the sequential
+comparison this program condemns everywhere else, and it was understating the
+result by roughly half.
+
+* **A** = commit `9ec4407a`, upstream 0.23.3 with only the `--timings`
+  instrumentation added. Upstream giallo, hash-ordered maps, platform allocator.
+* **B** = the current tree.
+* Three interleaved rounds per site, order flipped each round, one discarded
+  warmup per side, `scripts/perf/ab.py`. Every wall figure below is unanimous
+  across rounds.
+
+| workload | wall | peak RSS | CPU |
+| -------- | ---- | -------- | --- |
+| `simple-pages-4000` | 1.07 s → **0.84 s** (−22%) | 366 MB → **144 MB** (−60%) | −7.6% |
+| `mixed-realistic-4000` | 1.92 s → **1.08 s** (−46%) | 1307 MB → **217 MB** (−83%) | −8.0% |
+| `many-taxonomies-4000` | 1.93 s → **0.94 s** (−51%) | 1618 MB → **180 MB** (−89%) | −19.4% |
+| `markdown-heavy-4000` | 7.18 s → **1.91 s** (−74%) | 1297 MB → **505 MB** (−61%) | −42.4% |
+| `data-heavy-4000` | 2.70 s → **1.31 s** (−52%) | 909 MB → **549 MB** (−40%) | −8.2% |
+| `dense-internal-links-4000` | 2.25 s → **1.15 s** (−43%) | 860 MB → **306 MB** (−64%) | −15.1% |
+| `deep-sections-4000` | 1.10 s → **0.95 s** (−14%) | 383 MB → **160 MB** (−58%) | +0.1% (not unanimous) |
+| `template-heavy-4000` | 1.20 s → **1.08 s** (−23%) | 406 MB → **169 MB** (−58%) | −9.9% (not unanimous) |
+| `mixed-realistic-16000` | 9.57 s → **4.22 s** (−56%) | 4913 MB → **574 MB** (−88%) | −4.1% (not unanimous) |
+| the reference site (3776 pages, 9 GB output) | 44.3 s → **32.2 s** (−33%) | 676 MB → **504 MB** (−26%) | **−35.1%** |
+
+The reference-site row was measured while the machine carried a load average of
+~26 from unrelated work, so its absolute seconds are inflated — the same binary
+builds that site in 30.2 s on an idle machine. The paired delta is unaffected and
+was unanimous across all three rounds; it is quoted, the absolutes are not.
+
+### What the CPU column says
+
+Wall time halves on most scenarios while total CPU barely moves. That is not a
+contradiction and it is the most useful thing in the table: **this program did
+not make Zola execute fewer instructions — it made Zola stop waiting and stop
+allocating.**
+
+The wins came from a mutex that serialised twelve threads onto one
+(PERF-002), a serial phase that materialised a copy of every page for every
+container it belonged to (PERF-005a), a lock held across file I/O (PERF-001),
+and an allocator that could not keep up with megabyte-sized strings (PERF-012).
+Two workloads do show a large CPU drop: `markdown-heavy` (−42%), which is
+highlighting no longer contending on a lock, and the reference site (−35%),
+which is mostly the allocator (PERF-012) — its pages are megabytes, and that is
+the shape the platform allocator handled worst.
+
+The corollary is a limit: **on a machine with twelve cores there is not much
+parallelism left to unlock.** Further gains have to come from doing less work,
+and the profile says the remaining work is real — Tera interpreting templates
+(28%) and minify-html parsing what those templates produced (23%).
+
+### The memory result
+
+Peak memory falls on every scenario, by 40–89%, and the effect grows with the
+site: **4913 MB → 574 MB at 16 000 pages**. Per-page memory went from roughly
+307 KB to 36 KB.
+
+This is the part that changes what is possible rather than what is pleasant. At
+the old rate, a 50 000-page site needed about 15 GB and a 100 000-page site
+about 30 GB; at the new rate they need 1.8 GB and 3.6 GB. The wall that would
+have stopped large sites is gone, and it was never a CPU wall.
+
+---
+
+## PERF-016 — `zola serve` held the entire rendered site in memory
+
+**Problem.** `zola serve` runs in `BuildMode::Memory`: rendered HTML goes into the
+`SITE_CONTENT` global map instead of to disk, and stays there for the life of the
+process. On the reference site that is 6592 files and 9.03 GB of HTML held in a
+map — **9371 / 9368 / 9405 MB** of physical footprint against **493 MB** to build
+the same site. Nineteen times the build, and the largest memory figure this
+program has produced.
+
+The whole program had measured `zola build` and never `serve`, so this sat
+outside everything in `BASELINE.md`. It was also nearly missed: `ps -o rss`
+reports 8–20 MB for that process, because macOS compresses an idle process's
+pages out of resident memory. `footprint -p` is the metric that answers the
+question.
+
+**What landed.** Two changes, both measured on the reference site:
+
+| | resident | peak |
+| --- | -------- | ---- |
+| before | 9371 / 9368 / 9405 MB | 9431 MB |
+| compressed map | **882 / 870 / 878 MB** | 860 MB |
+| `--store-html`, served from disk | **289 MB** | 503 MB |
+
+1. **Compress what the map holds** (`c712c29d`). Pages of a template-driven site
+   are mostly the same bytes as themselves — the reference site's navigation is
+   88% of every page — so zstd at level 1 gets 29× on this data, measured per
+   output because that is how the map stores them. 10.7×, unanimous across three
+   interleaved rounds, byte-identical responses, no new flag, no new dependency
+   (zstd was already in the tree via giallo). The cost is startup: eight
+   interleaved rounds gave a median +13%, six slower and two faster, which is
+   unresolved in sign and consistent with the arithmetic — about two seconds for
+   9 GB at that level across eleven usable cores. On a 4000-page site with 200 MB
+   of output there is no measurable cost and memory goes 220 → 208 MB.
+2. **Let `--store-html` serve from disk** (`57802477`). It selected
+   `BuildMode::Both`, writing every page to disk *and* keeping it in memory,
+   although the request handler has always fallen back to the output directory on
+   a miss. It now selects `Disk`. Ten paths compared between a disk-backed and a
+   memory-backed server were byte-identical once the port each embeds in
+   `base_url` is normalised. The costs: a full rebuild pays for writing the files
+   (1.3–1.5 s against 0.45 s at 4000 pages), requests read the filesystem, and
+   responses carry `Access-Control-Allow-Origin: *`, which the disk path has
+   always sent.
+
+**What remains.** Render-on-demand serving is **not built**. `serve` already
+holds the `Library` and the `RenderCache`, so a request could render its page
+then — the same work `--fast` does for a whole rebuild in 34–41 ms — which would
+take the map to nothing at all. The map exists to make requests fast, and a
+preview server does not obviously need a page rendered before anyone asks for it.
+
+What that is worth is bounded, and the two figures above bound it: the compressed
+map is 878 − 289 = 589 MB, and the other 289 MB is the `Library`, the
+`RenderCache`, Tera and the runtime, which serving a request still needs. Render
+on demand therefore lands at roughly 289 MB — where `--store-html` already is.
+The prize is reaching that without writing the site to disk, not taking `serve`
+to nothing.
+That change interacts with the incremental-build design and is not one to make
+casually inside a program whose gate is byte-identical `zola build` output.
+
+Compression moved the wall from roughly 20k pages to roughly 200k on a 24 GiB
+machine, which buys enough room that the architectural change can wait for
+someone who needs it. Hence `partial` rather than `done`.
+
+**Correctness.** Responses byte-identical on ten paths including the 404;
+`components/site/tests/serve_modes.rs` asserts what each `BuildMode` holds and
+that the held bytes are compressed — it reports 1014‰ of the uncompressed page
+when compression is removed, so it fails for the right reason.
+`scripts/dev.sh quality`: ALL PASS.
+
+**Commit.** `c712c29d` (compression), `57802477` (`--store-html` serves from disk)
