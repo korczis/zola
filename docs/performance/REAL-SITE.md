@@ -43,6 +43,15 @@ Interleaved runs, same machine, same content, output to a temp directory,
 | 3 | 252.20 s | 34.87 s |
 | **median** | **252.20 s** | **34.87 s** |
 
+> **Both columns are historical.** They were measured when this document was
+> written, with the branch at PERF-001 and the site freshly migrated. Neither
+> number describes the current tree: the program has since landed PERF-002,
+> -005a, -006, -010, -012 and -013, and the site has taken the migration into its
+> own repository and moved on. For the current comparison — baseline `9ec4407a`
+> against the current tree, in one interleaved session — see
+> `docs/papers/zperf-001-faster-without-computing-less/`. The figures below are
+> kept as the record of that moment, not as a description of today.
+
 **7.2× faster.** The comparison is not a controlled A/B of a single change — it
 bundles the 0.22→0.23 engine work (the `RenderCache`, Tera 2), this branch's
 PERF-001 fix, and any cost difference introduced by the migration itself. It is
@@ -50,6 +59,13 @@ the number that matters in practice: the site's build goes from four minutes to
 half a minute.
 
 ## Where the remaining 35 seconds go
+
+Also historical, and superseded in one important way: the profile that produced
+this table predates PERF-012, when 34 s of 138 s of busy CPU turned out to be in
+the platform allocator. The current split is Tera at 28% and minify-html at 23%
+(`FINAL-REPORT.md` §20). What still holds, and is the reason this section is
+worth keeping, is the shape: **94% of the build is producing and writing output**,
+and minification of 1.6 MB pages is the single largest accumulator.
 
 `zola build --timings` on the migrated site (33.6 s wall):
 
