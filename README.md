@@ -68,7 +68,21 @@ The individual changes, each with its own measurement:
 | PERF-012 | mimalloc replaces the platform allocator, which was taking a quarter of the CPU on sites whose pages are megabytes rather than kilobytes | real site: build CPU −24%, peak RSS −10%; no effect on small-page sites |
 | PERF-001 | `load_data` releases its cache lock before doing I/O and parsing, instead of holding it throughout | page-render CPU 6.5 s → 1.8 s on a data-driven site |
 | PERF-006 | the content walk reads each directory once instead of twice | discovery −35% on section-dense trees |
+| PERF-013 | `get_url(cachebust=…)` and `get_hash` memoize file hashes instead of re-reading and re-hashing once per page | 2.2 s of CPU, below a whole-build A/B's noise floor and visible in the profile |
+| PERF-016 | `zola serve` compresses the pages it holds, and `--store-html` serves from disk instead of also keeping them | serving the reference site: 9.4 GB → 0.88 GB, or 0.29 GB from disk |
 | — | **builds are reproducible**: maps reaching templates iterate in a stable order | −9% wall, −15% RSS as a side effect |
+
+Two correctness bugs were found while measuring `zola serve`, both **pre-existing
+upstream** and both reproduced against `9ec4407a`:
+
+| fix | what it did |
+| --- | ----------- |
+| `zola serve --fast` | applied nothing at all — it re-parsed the file, ran the render job, printed `Done in 0ms`, and served the page as it was *before* the edit. A content edit on a 4000-page site now costs 34–41 ms. |
+| `zola serve --output-dir` | failed every rebuild after the first with "Directory already exists", reported success, and served the previous build. |
+
+A third is documented and not fixed: `search_for_file`'s containment check is
+bypassable through its fallback search locations
+([korczis/zola#1](https://github.com/korczis/zola/issues/1)).
 
 ### Behaviour differences from upstream
 

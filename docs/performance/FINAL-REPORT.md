@@ -195,6 +195,29 @@ same binary already differed, which is why the gate had to be repaired first.
    tree repeated on every page. The largest available win for that site is in
    the site, not in Zola.
 
+**Updated after the allocator work.** The list above was written before PERF-012
+and a re-profile, and item 1's conclusion — that output writing became the
+largest remaining item — no longer holds. On the reference site the profile now
+reads:
+
+| | share of busy CPU |
+| --- | ----------------- |
+| Tera interpreting templates | 28% |
+| minify-html parsing what those templates produced | 23% |
+| the allocator | 3.7 s, down from 34 s |
+
+Both of the top two are third-party and both are doing work the site asked for.
+Writing output is no longer the ceiling; **the ceiling is that a page which
+changed still has to be rendered and minified**, which is an argument for
+producing less rather than for producing it faster.
+
+5. **And a fifth item the original list could not name, because the program was
+   not measuring it**: `zola serve`. It held 9371 MB for the site that builds in
+   493 MB, and its `--fast` path applied nothing at all. Compression and
+   disk-backed serving addressed the memory; the correctness gap that remains is
+   that `--fast` still leaves listings, taxonomy terms and feeds stale. See
+   PERF-016 and `INCREMENTAL-BUILD-DESIGN.md`.
+
 ## What was rejected, and why that matters
 
 * **PERF-003** (cache created directories) — shared-lock and thread-local

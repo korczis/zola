@@ -119,8 +119,11 @@ renderer-agnostic; `site/src/md_render.rs` bridges them) and `config` →
   feed, sitemap, alias, 404, robots) becomes a `Job`; `process()` runs them with rayon and writes
   each `RenderedOutput` to disk and/or into `SITE_CONTENT`.
 - `site::BuildMode` + `SITE_CONTENT` — `zola build` writes to disk (`Disk`); `zola serve` keeps
-  HTML/XML in the `SITE_CONTENT` global map (`Memory`) and only writes assets, unless `--store-html`
-  (`Both`).
+  HTML/XML in memory (`Memory`) and only writes assets; `--store-html` selects `Disk` and serves
+  from the output directory, which the request handler already falls back to on a miss.
+  `SITE_CONTENT` is **private** — go through `site_content_{get,insert,clear,stats}` — and holds
+  **zstd-compressed** bytes, because serving a site cost as much memory as its entire output
+  (9.4 GB on a 9 GB site, against 493 MB to build it; PERF-016).
 
 ### Templating and content
 
@@ -144,7 +147,10 @@ registrations.
 `src/cmd/serve.rs` is an axum server plus a `notify` debouncer. `src/fs_utils.rs` classifies each
 filesystem event into a `ChangeKind` (Content/Templates/Themes/StaticFiles/Sass/Config/ExtraPath)
 and `serve.rs` matches on it to pick the cheapest rebuild. `--fast` restricts content changes to
-`Queue::single_page`/`single_section` instead of a full rebuild. A config change rebuilds the whole
+`Queue::single_page`/`single_section` instead of a full rebuild — and must refresh the `RenderCache`
+first, or it renders the copy serialized before the edit and silently serves stale HTML
+(`components/site/tests/fast_rebuild.rs`). It still re-renders only the changed page or section:
+listings, taxonomy terms and feeds that embed it stay stale until a full rebuild. A config change rebuilds the whole
 `Site`. Live reload is a WebSocket; build errors are injected into responses by
 `error_injection_middleware`.
 
