@@ -51,9 +51,12 @@ Two workloads matter throughout:
   taxonomies, internal links, section depth, template work, Markdown and code
   highlighting, per-page data loading, and a mixed profile calibrated against
   the real site. Sizes from 100 to 16,000 pages.
-* **A real site** — 3776 pages and 1640 sections, producing 6592 output files
-  and 9.03 GB of HTML. Its content is not redistributable; its shape is
-  documented, and the mixed synthetic scenario exists to approximate it.
+* **A real site** — [vomaste.cz](https://vomaste.cz), 3776 pages and 1640
+  sections, producing 6592 output files and 9.03 GB of HTML. It belongs to this
+  fork's author, which is why it could be measured in this detail; it is public,
+  so a reader can go and look at what produced these numbers. Its content is not
+  redistributable as a fixture, so its shape is documented instead and the mixed
+  synthetic scenario exists to approximate it.
 
 That second workload earns its place by being unreasonable. Its pages average
 1.6 MB because 88% of every page is the same navigation tree. Nothing in the

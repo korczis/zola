@@ -2,7 +2,7 @@
 
 **Four optimizations rejected on measurement, and the platform rule three of them found**
 
-> Zola at Scale, ZPERF-002. Status: **review**, 2026-08-13.
+> Zola at Scale, ZPERF-002. Status: **published**, 2026-08-13.
 >
 > This work was done in a fork of [Zola](https://github.com/getzola/zola). It is
 > not affiliated with, endorsed by, or speaking for the upstream project. None of

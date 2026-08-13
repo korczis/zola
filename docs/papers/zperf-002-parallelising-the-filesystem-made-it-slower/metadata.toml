@@ -1,7 +1,7 @@
 id = "ZPERF-002"
 title = "Parallelising the Filesystem Made It Slower"
 subtitle = "Four optimizations rejected on measurement, and the platform rule three of them found"
-status = "review"
+status = "published"
 type = ["negative-result"]
 series = "Zola at Scale"
 date = "2026-08-13"
@@ -32,3 +32,4 @@ keywords = ["zola", "rust", "performance", "rayon", "apfs", "macos", "create_dir
 # this fork; the gate is the evidence, not the author.
 authors = ["Tomas Korcak"]
 assisted_by = "Claude Opus 5"
+published_date = "2026-08-13"

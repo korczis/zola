@@ -10,7 +10,9 @@ where the machine-checkable ones carry the artifact path and the JSON key that
 `--timings` instrumentation added — upstream giallo, hash-ordered maps, platform
 allocator. **Candidate**: commit `c712c29d` unless stated otherwise.
 **Machine**: Apple M4 Pro, 12 cores, 24 GiB, macOS 26.2, release builds with the
-profile pinned by `scripts/perf/build.sh`.
+profile pinned by `scripts/perf/build.sh`. **Workload**: the reference site is
+vomaste.cz, which belongs to this fork's author; the artifacts name it
+(`site-vomaste.json`, `sites.vomaste-live.*`) and so does the paper.
 
 ---
 
